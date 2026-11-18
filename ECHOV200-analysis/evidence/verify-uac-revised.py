@@ -19,8 +19,9 @@ if "firmware_path" not in globals():
     firmware_path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("UAC-96-high-speed-revised/ECHOV200.IMG")
 image = firmware_path.read_bytes()
 revision = unpack_from("<H", image, 0x8084C)[0]
-assert revision in (0x0206, 0x0207, 0x0208, 0x0209)
+assert revision in (0x0206, 0x0207, 0x0208, 0x0209, 0x0210, 0x0211)
 rate_192 = revision >= 0x0208
+pcm_32 = revision >= 0x0210
 base = unpack_from("<I", image, 0x200)[0]
 load, run_address, length = unpack_from("<III", image, MODULE_RECORD)
 cpu = Uc(UC_ARCH_ARM, UC_MODE_THUMB | UC_MODE_MCLASS)
@@ -199,7 +200,8 @@ for hs_speed in (False,True):
     response(b"\x0a\x06\x00\x02"+other+b"\x01\x00")
     for dtype,ptr in ((2,hs_config if hs_speed else fs_config),(7,fs_config if hs_speed else hs_config)):
         desc=bytearray(read(ptr,half(ptr+2)))
-        assert len(desc)==((290 if rate_192 else 198) if ptr==hs_config else 230)
+        hs_length = 336 if pcm_32 else 290 if rate_192 else 198
+        assert len(desc)==(hs_length if ptr==hs_config else 230)
         for max_len in (9,512):
             request(0x80,6,dtype<<8,0,max_len)
             n=min(max_len,len(desc))
@@ -256,14 +258,27 @@ def clock_rate(frequency):
 
 copied=[]
 stub(0x030602f6,lambda: copied.append((r(1),read(r(1),r(3)*4))))
+if pcm_32:
+    descriptors = []
+    p = hs_config + 9
+    while p < hs_config + half(hs_config+2):
+        length = read(p,1)[0]
+        assert length >= 2
+        descriptors.append(read(p,length))
+        p += length
+    alt = next(i for i, d in enumerate(descriptors) if d[:5] == b"\x09\x04\x01\x05\x01")
+    assert descriptors[alt+2] == bytes((6,0x24,2,1,4,32))
+    assert descriptors[alt+3] == pack("<BBBBHB",7,5,2,9,392,2)
 for rate in clock_rates:
     clock_rate(rate)
     request(0xa1,1,0x0100,0x0400,4)
     response(pack("<I",rate))
     alternates=((3,16,388,3),(4,24,300,2)) if rate==192000 else ((1,16,196,3),(2,24,294,3))
+    if pcm_32:
+        alternates += ((5,32,392,2),)
     for host_alt,bits,mps,interval in alternates:
         request(1,11,host_alt,1)
-        mode=2*clock_rates.index(rate)+(1 if bits==16 else 2)
+        mode=7+clock_rates.index(rate) if bits==32 else 2*clock_rates.index(rate)+(1 if bits==16 else 2)
         assert current()[0]==mode and word(CTRL)&0x7ff==mps
         request(0x81,10,0,1,1)
         response(bytes([host_alt]))
@@ -299,7 +314,7 @@ for rate in clock_rates:
         assert read(RING,len(expected))==expected and word(STATE+0x14)==len(expected)
         assert rate<=48000 or len(expected)>=2048
         print(f"HS core: {bits}/{rate}, {transactions} consecutive transfers, PCM alignment and DMA format passed.",flush=True)
-        if rate>=96000 and bits==24:
+        if rate>=96000 and bits>=24:
             put(STATE+0x24,block_size//4)
             put(STATE+0x3c,0)
             cpu.mem_write(0x03024b60,b"\x3c\0")
@@ -316,9 +331,9 @@ for rate in clock_rates:
         request(1,11,0,1)
         poll()
         assert current()==(0,0)
-request(1,11,5 if rate_192 else 3,1)
+request(1,11,6 if pcm_32 else 5 if rate_192 else 3,1)
 assert current()==(0,0) and word(USB+0x900)&0x200000
-print("HS 24-bit DMA retained low sample bits, only valid host alternate settings accepted.",flush=True)
+print("HS DMA retained low sample bits, only valid host alternate settings accepted.",flush=True)
 
 request(0x80,6,0x0304,0x0409,62)
 raw=events[-1][1]
@@ -328,7 +343,7 @@ for p in range(2,len(raw),6):
     digits=unpack_from("<3H",raw,p)
     assert all(x&0xf000==0xe000 for x in digits)
     vals.append((digits[0]&4095)|((digits[1]&4095)<<12)|((digits[2]&4095)<<24))
-assert vals[0:2]==[clock_rates[-1],24] and vals[2:4]==[0,0]
+assert vals[0:2]==[clock_rates[-1],32 if pcm_32 else 24] and vals[2:4]==[0,0]
 mask=0
 for sample in unpack(f"<{block_size//4}I",expected[block_size:2*block_size]):
     mask|=sample
@@ -429,11 +444,23 @@ if rate_192:
     request(1,11,0,1)
     poll()
 
+    if pcm_32:
+        request(1,11,5,1)
+        assert current()[0]==9 and (word(CTRL)&0x7ff)==392
+        for rate,mode in ((48000,7),(96000,8),(192000,9)):
+            clock_rate(rate)
+            poll()
+            execute(0x0307ff56)
+            assert current()==(mode,mode)
+            assert word(MUSIC+8)==rate and word(MUSIC+0x9c)==32
+        request(1,11,0,1)
+        poll()
+
     # Run the stock startup path as well as the DMA callback tested above.
     request(1,11,4,1)
     poll()
     execute(0x0307ff56)
-    if revision == 0x0209:
+    if revision >= 0x0209:
         # An odd 49-frame packet crosses the ring end after its first frame.
         start = 0x8ff8
         samples = [(-1)**i * (0x1234ff - 0x101 * i) for i in range(98)]
@@ -499,4 +526,49 @@ if rate_192:
     request(1,11,4,1)
     assert word(USB+0x900)&0x200000 and current()==(0,0)
     print("All three full-speed formats passed; full-speed alternate 4 stalled.",flush=True)
+
+if pcm_32:
+    for bits in (16,24,32):
+        peak = 1 << (bits-1)
+        samples = [-peak, -peak+1, -513, -61, -2, -1, 0, 1, 2, 61, 513, peak-2, peak-1]
+        # Legacy 16-bit input can gain fractional bits in the existing
+        # left-aligned 24-bit volume path.
+        width = max(24,bits)
+        input_words = [x << (width-bits) for x in samples]
+        put(MUSIC+0x9c,bits)
+        put(STATE+0x24,len(samples))
+        for gain,mute,output in [(g,0,1) for g in range(61)] + [(255,0,1),(60,1,1),(60,0,0)]:
+            cpu.mem_write(0x03024b60,bytes((gain,mute)))
+            cpu.mem_write(0x0302235e,bytes((output,)))
+            cpu.mem_write(DMA_BUFFER,converted(samples,bits))
+            execute(0x0307fd7c,DMA_BUFFER,STATE+0x24)
+            scale = min(gain,60) if output and not mute else 0
+            scaled = [(abs(x)*scale//60)*(-1 if x<0 else 1) for x in input_words]
+            assert read(DMA_BUFFER,len(samples)*4) == converted(scaled,width), (bits,gain,mute,output)
+            assert word(STATE+0x34) == scaled.count(0)
+            assert word(STATE+0x38) == int(len(scaled)-scaled.count(0)>=2)
+    print("16-, 24- and 32-bit gain, signed endpoints, low bits and mute passed.",flush=True)
+
+    # Exercise the real enumeration callback and the stock physical key
+    # handler. Only the two DAC register writes are modelled.
+    for hs in (False,True):
+        cpu.mem_write(STATE+4,b"\0")
+        set_speed(hs)
+        enabled = not hs or revision >= 0x0211
+        assert read(STATE+4,1) == bytes((int(enabled),))
+        for before,key,after,attenuation in (
+            (60,0x10000020,61,59),
+            (60,0x10000010,59,61),
+            (1,0x10000010,0,255),
+            (0,0x10000020,1,200),
+            (120,0x10000020,120,None),
+            (0,0x10000010,0,None),
+        ):
+            cpu.mem_write(0x0302235e,bytes((before,)))
+            dac_writes.clear()
+            execute(0x030802ce,key)
+            assert read(0x0302235e,1) == bytes((after if enabled else before,))
+            expected = [(0x90001,attenuation),(0x90002,attenuation)] if enabled and attenuation is not None else []
+            assert dac_writes == expected
+    print("USB-speed connection state and the native volume keys matched the expected DAC writes.",flush=True)
 

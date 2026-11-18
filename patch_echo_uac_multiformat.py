@@ -25,9 +25,15 @@ FORMATS = ((16, 48_000), (24, 48_000), (24, 96_000))
 DIAGNOSTIC_FORMATS = ((16, 48_000), (24, 48_000), (16, 96_000), (24, 96_000))
 CLOCK_TEST_FORMATS = DIAGNOSTIC_FORMATS[:3]
 FORMATS_192 = DIAGNOSTIC_FORMATS + ((16, 192_000), (24, 192_000))
+FORMATS_32 = FORMATS_192 + tuple((32, rate) for rate in (48_000, 96_000, 192_000))
 DMA_BUFFER_192 = 0x03030000
 PACKED_192_WRITER = 0x0307F95C
 PACKED_192_WRITER_END = 0x0307F9A8
+PCM_VOLUME = 0x0307FD7C
+PCM_VOLUME_END = 0x0307FDFA
+STOCK_FS_CONFIG_OFFSET = 0x80744
+STOCK_FS_CONFIG_ADDRESS = 0x03024B68
+STOCK_FS_AUDIO_ENDPOINT = 0x5E
 
 
 def assemble(text, address):
@@ -102,7 +108,7 @@ def make_descriptors(previous, formats=FORMATS, record_size=32):
     return config, table
 
 
-def make_high_speed_descriptors(previous, revised=False, rate_192=False):
+def make_high_speed_descriptors(previous, revised=False, rate_192=False, pcm_32=False):
     config = bytearray(previous[0x80744:0x80744 + 9])
     # IAD and AudioControl interface. The clock, USB input terminal and
     # headphone output terminal share entity IDs 4, 1 and 2 respectively.
@@ -127,6 +133,8 @@ def make_high_speed_descriptors(previous, revised=False, rate_192=False):
         # One extra frame above the old 294-byte limit gives the host an
         # unambiguous smaller alternate to select for 48 and 96 kHz.
         alternates.extend(((16, 192_000, 3, 1), (24, 192_000, 2, 2)))
+    if pcm_32:
+        alternates.append((32, 192_000, 2, 1))
     for alternate, (bits, ceiling, interval, padding_frames) in enumerate(alternates, start=1):
         subslot_size = bits // 8
         transfers_per_second = 8_000 >> (interval - 1)
@@ -151,7 +159,7 @@ def make_high_speed_descriptors(previous, revised=False, rate_192=False):
     if rate_192:
         # USB limits are indexed by host alternate, PCM setup by format.
         table = bytearray(pack("<IHBB", 48_000, 0, 4, 16))
-        for bits, frequency in FORMATS_192:
+        for bits, frequency in FORMATS_32 if pcm_32 else FORMATS_192:
             table.extend(pack("<IHBB", frequency, 0, bits // 4, bits))
         return config, table, packet_limits
 
@@ -164,7 +172,7 @@ def make_high_speed_descriptors(previous, revised=False, rate_192=False):
 
 def build_multiformat(source, assembly, *, diagnostics=False, clock_test=False,
                       dma_test=False, high_speed=False, revised=False, recovery=False,
-                      rate_192=False, packed_192=False):
+                      rate_192=False, packed_192=False, pcm_32=False, volume_keys=False):
     image, _ = build_image(source, packed_usb=True)
     image_base, module_count = unpack_from("<II", image, 0x200)
     load_address, run_address, length = unpack_from("<III", image, MODULE_RECORD)
@@ -176,6 +184,8 @@ def build_multiformat(source, assembly, *, diagnostics=False, clock_test=False,
     ):
         raise ValueError("Unexpected module 11 layout")
 
+    pcm_32 = pcm_32 or volume_keys
+    packed_192 = packed_192 or pcm_32
     rate_192 = rate_192 or packed_192
     recovery = recovery or rate_192
     revised = revised or recovery
@@ -200,10 +210,18 @@ def build_multiformat(source, assembly, *, diagnostics=False, clock_test=False,
     format_hs_table = format_table
     hs_packet_limits = []
     if high_speed:
-        config_hs, table_hs, hs_packet_limits = make_high_speed_descriptors(image, revised, rate_192)
+        config_hs, table_hs, hs_packet_limits = make_high_speed_descriptors(
+            image, revised, rate_192, pcm_32
+        )
         config_hs_base = format_table + len(table)
         hs_alignment = 4 if recovery else 32
         format_hs_table = config_hs_base + ((len(config_hs) + hs_alignment - 1) & -hs_alignment)
+    if pcm_32:
+        # Both configuration pointers are redirected. The legacy setup
+        # routine can still reference the original audio and HID endpoints.
+        if len(table_hs) > STOCK_FS_AUDIO_ENDPOINT:
+            raise ValueError("PCM table overlaps the stock audio endpoint")
+        format_hs_table = STOCK_FS_CONFIG_ADDRESS
     assembly = (
         assembly.replace("__MODE_TABLE__", f"0x{format_table:08x}")
         .replace("__HS_MODE_TABLE__", f"0x{format_hs_table:08x}")
@@ -216,6 +234,7 @@ def build_multiformat(source, assembly, *, diagnostics=False, clock_test=False,
         .replace("__RECOVERY__", str(int(recovery)))
         .replace("__RATE_192__", str(int(rate_192)))
         .replace("__PACKED_192__", str(int(packed_192)))
+        .replace("__PCM_32__", str(int(pcm_32)))
         .replace("__PACKED_192_WRITER__", f"0x{PACKED_192_WRITER:08x}")
         .replace("__HS_PACKET_LIMITS__", ", ".join(map(str, hs_packet_limits)))
         .replace("__DMA_BUFFER__", hex(DMA_BUFFER_192 if rate_192 else 0x0302DD88))
@@ -256,6 +275,8 @@ def build_multiformat(source, assembly, *, diagnostics=False, clock_test=False,
         if not bss <= DMA_BUFFER_192 < DMA_BUFFER_192 + 0x2000 <= bss + bss_size:
             raise ValueError("192 kHz DMA buffers exceed module 11 BSS")
         widen_dma_buffers(overlay)
+    if volume_keys:
+        enable_high_speed_buttons(overlay)
     if packed_192:
         writer_source = Path(__file__).with_name("uac_packed192.S").read_text(encoding="utf-8")
         writer = assemble(writer_source, PACKED_192_WRITER)
@@ -265,6 +286,13 @@ def build_multiformat(source, assembly, *, diagnostics=False, clock_test=False,
         # of the stock ring writer in this overlay.
         start = PACKED_192_WRITER - CODE_BASE
         overlay[start:start + len(writer)] = writer
+    if pcm_32:
+        volume_source = Path(__file__).with_name("uac_volume32.S").read_text(encoding="utf-8")
+        volume = assemble(volume_source, PCM_VOLUME)
+        if len(volume) > PCM_VOLUME_END - PCM_VOLUME:
+            raise ValueError("PCM volume routine overlaps live module 11 code")
+        start = PCM_VOLUME - CODE_BASE
+        overlay[start:start + len(volume)] = volume
     if recovery:
         recovery_source = Path(__file__).with_name("uac_recovery.S").read_text(encoding="utf-8")
         recovery_code = assemble_diagnostics(recovery_source, 0x0307FBD4)
@@ -286,6 +314,7 @@ def build_multiformat(source, assembly, *, diagnostics=False, clock_test=False,
     overlay.extend(table)
     if high_speed:
         overlay.extend(config_hs)
+    if high_speed and not pcm_32:
         overlay.extend(bytes(format_hs_table - CODE_BASE - len(overlay)))
         overlay.extend(table_hs)
 
@@ -306,6 +335,8 @@ def build_multiformat(source, assembly, *, diagnostics=False, clock_test=False,
     pack_into("<III", image, 0x80804, len(config), config_hs_base, config_base)
     pack_into("<II", image, 0x80810, EXTENSION_BASE | 1, (EXTENSION_BASE + 8) | 1)
     pack_into("<II", image, 0x8081C, (EXTENSION_BASE + 12) | 1, (EXTENSION_BASE + 4) | 1)
+    if pcm_32:
+        image[STOCK_FS_CONFIG_OFFSET:STOCK_FS_CONFIG_OFFSET + len(table_hs)] = table_hs
     revision = 0x0201
     if high_speed:
         enable_high_speed(image, EXTENSION_BASE + 52 if revised else None)
@@ -318,6 +349,10 @@ def build_multiformat(source, assembly, *, diagnostics=False, clock_test=False,
             revision = 0x0208
         if packed_192:
             revision = 0x0209
+        if pcm_32:
+            revision = 0x0210
+        if volume_keys:
+            revision = 0x0211
     elif dma_test:
         revision = 0x0204
     elif clock_test:
@@ -340,6 +375,22 @@ def build_multiformat(source, assembly, *, diagnostics=False, clock_test=False,
     crc = rockchip_crc32(memoryview(image)[:-4])
     pack_into("<I", image, len(image) - 4, crc)
     return image, crc
+
+
+def enable_high_speed_buttons(overlay):
+    # The stock event sets STATE+4 on speed 2 (FS). The key handler needs
+    # this flag before it will apply a change to the DAC's local volume.
+    # USB enumeration supplies speed 3 at HS; both 2 and 3 shift to 1.
+    address = 0x0307FC82
+    event = "cmp r4, #0x10\nitte eq\n"
+    leave = "\npopne.w {r4, r5, r6, r7, r8, pc}"
+    original = assemble(event + "uxtbeq r0, r5\ncmpeq r0, #2" + leave, address)
+    updated = assemble(event + "lsreq r0, r5, #1\ncmpeq r0, #1" + leave, address)
+    start = address - CODE_BASE
+    end = start + len(original)
+    if len(updated) != len(original) or overlay[start:end] != original:
+        raise ValueError("Unexpected USB DAC button connection check")
+    overlay[start:end] = updated
 
 
 def widen_dma_buffers(overlay):
@@ -432,6 +483,16 @@ def main():
         help="Write packed 24-bit/192 kHz samples directly to the playback ring",
     )
     variant.add_argument(
+        "--high-speed-pcm32",
+        action="store_true",
+        help="Add true 32-bit stereo PCM at 48, 96 and 192 kHz over high-speed USB",
+    )
+    variant.add_argument(
+        "--high-speed-pcm32-volume-keys",
+        action="store_true",
+        help="Enable the ECHO volume keys after high-speed USB DAC enumeration",
+    )
+    variant.add_argument(
         "--high-speed-recovery",
         action="store_true",
         help="Recover a stopped high-speed isochronous OUT transfer in the audio task",
@@ -458,6 +519,8 @@ def main():
         recovery=args.high_speed_recovery,
         rate_192=args.high_speed_192,
         packed_192=args.high_speed_192_packed,
+        pcm_32=args.high_speed_pcm32,
+        volume_keys=args.high_speed_pcm32_volume_keys,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     target = args.output.open("xb")

@@ -33,6 +33,7 @@
 .equ RECOVERY,         __RECOVERY__
 .equ RATE_192,         __RATE_192__
 .equ PACKED_192,       __PACKED_192__
+.equ PCM_32,           __PCM_32__
 .if REVISED
 .equ RING,            0x03024ce8
 .equ RX_DROPPED,       32
@@ -61,6 +62,13 @@
 .equ DIAG_MAX,         16
 .equ DIAG_READY,       20
 .equ DIAG_DMA,         24
+.if PCM_32
+.equ DIAG_MODE_BITS,   4
+.equ DIAG_CLOCK_SHIFT, 8
+.else
+.equ DIAG_MODE_BITS,   3
+.equ DIAG_CLOCK_SHIFT, 9
+.endif
 .endif
 
 // Fixed four-byte entry points. The image builder binds these to module 11.
@@ -167,7 +175,11 @@ change_streaming:
     cmp  r1, #3
     bne  full_speed_alternate
 .if RATE_192
+.if PCM_32
+    cmp  r0, #5
+.else
     cmp  r0, #4
+.endif
     bhi  reject_setup
 .else
     cmp  r0, #2
@@ -360,11 +372,19 @@ arm_high_speed_alternate:
 no_high_speed_endpoint:
     bx   lr
 
-// Map host alternate and clock to one of the six PCM formats. Hosts can
+// Map host alternate and clock to the internal PCM format. Hosts can
 // issue clock and interface requests in either order during a transition.
 high_speed_mode:
     cbz  r0, high_speed_mode_done
     ldrb r2, [r1, #RATE_OFFSET]
+.if PCM_32
+    cmp  r0, #5
+    bne  high_speed_legacy_mode
+    lsrs r0, r2, #1
+    adds r0, #7
+    bx   lr
+high_speed_legacy_mode:
+.endif
     cmp  r0, #2
     bhi  high_speed_mode_index
     cmp  r2, #4
@@ -648,7 +668,11 @@ unpack_packet:
     cbz  r7, discard_packet
 .if PACKED_192
     cmp  r4, #6
+.if PCM_32
+    blo  expand_pcm
+.else
     bne  expand_pcm
+.endif
     lsls r7, #3
     b    samples_ready
 expand_pcm:
@@ -1239,7 +1263,9 @@ diag_disconnect:
 diag_select:
     cbz  r0, diag_report_gate
     ldr  r1, =STREAM
+.if !PCM_32
     strb r0, [r1, #DIAG_ALTERNATE]
+.endif
     movs r0, #0
     strb r0, [r1, #DIAG_CLOCKED]
     str  r0, [r1, #DIAG_RX]
@@ -1319,14 +1345,16 @@ diag_report:
 
     ldrb r1, [r0, #REQUESTED]
     ldrb r2, [r0, #APPLIED]
-    orr.w r1, r1, r2, lsl #3
+    orr.w r1, r1, r2, lsl #DIAG_MODE_BITS
+.if !PCM_32
     ldrb r2, [r0, #DIAG_ALTERNATE]
     orr.w r1, r1, r2, lsl #6
+.endif
     ldrb r2, [r0, #DIAG_CLOCKED]
-    orr.w r1, r1, r2, lsl #9
+    orr.w r1, r1, r2, lsl #DIAG_CLOCK_SHIFT
     ldr  r2, [r4, #0x48]
     ubfx r2, r2, #19, #1
-    orr.w r1, r1, r2, lsl #10
+    orr.w r1, r1, r2, lsl #(DIAG_CLOCK_SHIFT + 1)
     orr  r1, r1, #0xe800
     strh r1, [r5], #2
 

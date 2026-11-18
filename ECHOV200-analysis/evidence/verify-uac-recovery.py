@@ -8,7 +8,14 @@ exec(compile(base,"verify-uac-recovery-base","exec"))
 # Each poll returns while the controller completes its NAK and disable steps.
 set_speed(True)
 put(STREAM,4,4)
-if rate_192:
+payload_bytes=288
+if pcm_32:
+    # Mode 9 is 32/192. The watchdog must rearm host alternate 5.
+    put(STREAM,9,9)
+    cpu.mem_write(STREAM+29,b"\x05")
+    mps=392
+    payload_bytes=384
+elif rate_192:
     # Mode 6 is 24/192. The watchdog must rearm host alternate 4.
     put(STREAM,6,6)
     cpu.mem_write(STREAM+29,b"\x04")
@@ -37,7 +44,7 @@ assert word(CTRL)&0x80000000==0 and word(USB+0x804)&0x400
 execute(0x0307f710,USB+0x840,4,0x10,2,stop=0x0307f72e)
 assert word(CTRL)&0x80000000
 before=word(STREAM+12)
-rx(bytes(288),mps)
+rx(bytes(payload_bytes),mps)
 assert word(STREAM+12)==before+1
 # Missing hardware acknowledgement clears the request after a bounded interval.
 ack_out_nak=False
