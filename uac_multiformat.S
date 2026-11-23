@@ -34,6 +34,7 @@
 .equ RATE_192,         __RATE_192__
 .equ PACKED_192,       __PACKED_192__
 .equ PCM_32,           __PCM_32__
+.equ HOST_VOLUME,      __HOST_VOLUME__
 .if REVISED
 .equ RING,            0x03024ce8
 .equ RX_DROPPED,       32
@@ -908,7 +909,11 @@ uac2_control:
     cmp  r3, #2                  // HID still uses the stock class handler.
     beq  stock_setup_request
     cmp.w r3, #0x400
+.if HOST_VOLUME
+    bne.w stock_setup_request   // Feature Unit and HID share the class handler.
+.else
     bne.w reject_setup
+.endif
     ldrh r3, [r0, #2]
     cmp.w r3, #0x100
     bne  check_clock_valid
@@ -1240,6 +1245,12 @@ diag_connect:
 .if HIGH_SPEED
     movs r0, #0
     strb r0, [r1, #RATE_OFFSET]
+.endif
+.if HOST_VOLUME
+    // Clear the controls and gain for a fresh enumeration. The two words
+    // match HOST_STATE in uac_host_volume.S.
+    str  r0, [r1, #60]
+    str  r0, [r1, #64]
 .endif
     movs r0, #1
     strb r0, [r1, #DIAG_ENABLED]

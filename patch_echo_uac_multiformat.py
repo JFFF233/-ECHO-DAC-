@@ -31,6 +31,10 @@ PACKED_192_WRITER = 0x0307F95C
 PACKED_192_WRITER_END = 0x0307F9A8
 PCM_VOLUME = 0x0307FD7C
 PCM_VOLUME_END = 0x0307FDFA
+HOST_VOLUME_SET = 0x0307F9A8
+HOST_VOLUME_SET_END = 0x0307FA48
+HOST_VOLUME_SETUP = 0x0307FB04
+HOST_VOLUME_SETUP_END = 0x0307FBBE
 STOCK_FS_CONFIG_OFFSET = 0x80744
 STOCK_FS_CONFIG_ADDRESS = 0x03024B68
 STOCK_FS_AUDIO_ENDPOINT = 0x5E
@@ -108,17 +112,22 @@ def make_descriptors(previous, formats=FORMATS, record_size=32):
     return config, table
 
 
-def make_high_speed_descriptors(previous, revised=False, rate_192=False, pcm_32=False):
+def make_high_speed_descriptors(previous, revised=False, rate_192=False, pcm_32=False,
+                                host_volume=False):
     config = bytearray(previous[0x80744:0x80744 + 9])
     # IAD and AudioControl interface. The clock, USB input terminal and
     # headphone output terminal share entity IDs 4, 1 and 2 respectively.
     config.extend(bytes((8, 11, 0, 2, 1, 0, 0x20, 0)))
     config.extend(bytes((9, 4, 0, 0, 0, 1, 1, 0x20, 0)))
-    control = bytes((
+    control = bytearray((
         8, 0x24, 0x0A, 4, 3, 7, 0, 0,
         17, 0x24, 2, 1, 1, 1, 0, 4, 2, 3, 0, 0, 0, 0, 0, 0, 0,
-        12, 0x24, 3, 2, 2, 3, 0, 1, 4, 0, 0, 0,
     ))
+    if host_volume:
+        # Feature Unit 3 provides read/write mute and volume on the master
+        # channel. Connect it between the USB input and headphone output.
+        control.extend(pack("<5B3IB", 18, 0x24, 6, 3, 1, 0x0F, 0, 0, 0))
+    control.extend(bytes((12, 0x24, 3, 2, 2, 3, 0, 3 if host_volume else 1, 4, 0, 0, 0)))
     config.extend(pack("<BBBHBHB", 9, 0x24, 1, 0x0200, 3, 9 + len(control), 0))
     config.extend(control)
     config.extend(bytes((9, 4, 1, 0, 0, 1, 2, 0x20, 0)))
@@ -172,7 +181,8 @@ def make_high_speed_descriptors(previous, revised=False, rate_192=False, pcm_32=
 
 def build_multiformat(source, assembly, *, diagnostics=False, clock_test=False,
                       dma_test=False, high_speed=False, revised=False, recovery=False,
-                      rate_192=False, packed_192=False, pcm_32=False, volume_keys=False):
+                      rate_192=False, packed_192=False, pcm_32=False, volume_keys=False,
+                      host_volume=False):
     image, _ = build_image(source, packed_usb=True)
     image_base, module_count = unpack_from("<II", image, 0x200)
     load_address, run_address, length = unpack_from("<III", image, MODULE_RECORD)
@@ -184,6 +194,7 @@ def build_multiformat(source, assembly, *, diagnostics=False, clock_test=False,
     ):
         raise ValueError("Unexpected module 11 layout")
 
+    volume_keys = volume_keys or host_volume
     pcm_32 = pcm_32 or volume_keys
     packed_192 = packed_192 or pcm_32
     rate_192 = rate_192 or packed_192
@@ -211,7 +222,7 @@ def build_multiformat(source, assembly, *, diagnostics=False, clock_test=False,
     hs_packet_limits = []
     if high_speed:
         config_hs, table_hs, hs_packet_limits = make_high_speed_descriptors(
-            image, revised, rate_192, pcm_32
+            image, revised, rate_192, pcm_32, host_volume
         )
         config_hs_base = format_table + len(table)
         hs_alignment = 4 if recovery else 32
@@ -235,6 +246,7 @@ def build_multiformat(source, assembly, *, diagnostics=False, clock_test=False,
         .replace("__RATE_192__", str(int(rate_192)))
         .replace("__PACKED_192__", str(int(packed_192)))
         .replace("__PCM_32__", str(int(pcm_32)))
+        .replace("__HOST_VOLUME__", str(int(host_volume)))
         .replace("__PACKED_192_WRITER__", f"0x{PACKED_192_WRITER:08x}")
         .replace("__HS_PACKET_LIMITS__", ", ".join(map(str, hs_packet_limits)))
         .replace("__DMA_BUFFER__", hex(DMA_BUFFER_192 if rate_192 else 0x0302DD88))
@@ -286,7 +298,9 @@ def build_multiformat(source, assembly, *, diagnostics=False, clock_test=False,
         # of the stock ring writer in this overlay.
         start = PACKED_192_WRITER - CODE_BASE
         overlay[start:start + len(writer)] = writer
-    if pcm_32:
+    if host_volume:
+        install_host_volume(overlay)
+    elif pcm_32:
         volume_source = Path(__file__).with_name("uac_volume32.S").read_text(encoding="utf-8")
         volume = assemble(volume_source, PCM_VOLUME)
         if len(volume) > PCM_VOLUME_END - PCM_VOLUME:
@@ -317,6 +331,9 @@ def build_multiformat(source, assembly, *, diagnostics=False, clock_test=False,
     if high_speed and not pcm_32:
         overlay.extend(bytes(format_hs_table - CODE_BASE - len(overlay)))
         overlay.extend(table_hs)
+    if host_volume:
+        # Keep the load size word-aligned after adding the 18-byte descriptor.
+        overlay.extend(bytes(-len(overlay) % 4))
 
     # The firmware's two USB modes load module 11 or 12 in isolation.
     # Keep all original entry addresses and bound the extended UAC code
@@ -353,6 +370,8 @@ def build_multiformat(source, assembly, *, diagnostics=False, clock_test=False,
             revision = 0x0210
         if volume_keys:
             revision = 0x0211
+        if host_volume:
+            revision = 0x0212
     elif dma_test:
         revision = 0x0204
     elif clock_test:
@@ -391,6 +410,31 @@ def enable_high_speed_buttons(overlay):
     if len(updated) != len(original) or overlay[start:end] != original:
         raise ValueError("Unexpected USB DAC button connection check")
     overlay[start:end] = updated
+
+
+def install_host_volume(overlay):
+    # The stock callbacks at these entries implement UAC1 class requests,
+    # receive their SET payload, and scale the outgoing PCM respectively.
+    # Keep their callers and dispatch addresses while replacing the bodies.
+    sections = (
+        (HOST_VOLUME_SET, HOST_VOLUME_SET_END, "set_complete"),
+        (HOST_VOLUME_SETUP, HOST_VOLUME_SETUP_END, "class_setup"),
+        (PCM_VOLUME, PCM_VOLUME_END, "scale_volume"),
+    )
+    source = Path(__file__).with_name("uac_host_volume.S").read_text(encoding="utf-8")
+    assembly = source.replace("__SET_COMPLETE__", hex(HOST_VOLUME_SET))
+    start = sections[0][0]
+    code = assemble_diagnostics(assembly, start)
+    if len(code) != PCM_VOLUME_END - start:
+        raise ValueError("Unexpected host volume section layout")
+    for index, (address, end, label) in enumerate(sections):
+        first = address - start
+        last = end - start
+        following = sections[index + 1][0] - start if index + 1 < len(sections) else len(code)
+        # The .org directives leave zeroes between the three bodies.
+        if any(code[last:following]):
+            raise ValueError(f"Host volume {label} overlaps live module 11 code")
+        overlay[address - CODE_BASE:end - CODE_BASE] = code[first:last]
 
 
 def widen_dma_buffers(overlay):
@@ -493,6 +537,11 @@ def main():
         help="Enable the ECHO volume keys after high-speed USB DAC enumeration",
     )
     variant.add_argument(
+        "--high-speed-pcm32-host-volume",
+        action="store_true",
+        help="Add USB host volume and mute control at both USB speeds",
+    )
+    variant.add_argument(
         "--high-speed-recovery",
         action="store_true",
         help="Recover a stopped high-speed isochronous OUT transfer in the audio task",
@@ -521,6 +570,7 @@ def main():
         packed_192=args.high_speed_192_packed,
         pcm_32=args.high_speed_pcm32,
         volume_keys=args.high_speed_pcm32_volume_keys,
+        host_volume=args.high_speed_pcm32_host_volume,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     target = args.output.open("xb")

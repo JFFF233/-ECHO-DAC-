@@ -19,9 +19,10 @@ if "firmware_path" not in globals():
     firmware_path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("UAC-96-high-speed-revised/ECHOV200.IMG")
 image = firmware_path.read_bytes()
 revision = unpack_from("<H", image, 0x8084C)[0]
-assert revision in (0x0206, 0x0207, 0x0208, 0x0209, 0x0210, 0x0211)
+assert revision in (0x0206, 0x0207, 0x0208, 0x0209, 0x0210, 0x0211, 0x0212)
 rate_192 = revision >= 0x0208
 pcm_32 = revision >= 0x0210
+host_volume = revision >= 0x0212
 base = unpack_from("<I", image, 0x200)[0]
 load, run_address, length = unpack_from("<III", image, MODULE_RECORD)
 cpu = Uc(UC_ARCH_ARM, UC_MODE_THUMB | UC_MODE_MCLASS)
@@ -201,6 +202,8 @@ for hs_speed in (False,True):
     for dtype,ptr in ((2,hs_config if hs_speed else fs_config),(7,fs_config if hs_speed else hs_config)):
         desc=bytearray(read(ptr,half(ptr+2)))
         hs_length = 336 if pcm_32 else 290 if rate_192 else 198
+        if host_volume:
+            hs_length += 18
         assert len(desc)==(hs_length if ptr==hs_config else 230)
         for max_len in (9,512):
             request(0x80,6,dtype<<8,0,max_len)
@@ -269,6 +272,13 @@ if pcm_32:
     alt = next(i for i, d in enumerate(descriptors) if d[:5] == b"\x09\x04\x01\x05\x01")
     assert descriptors[alt+2] == bytes((6,0x24,2,1,4,32))
     assert descriptors[alt+3] == pack("<BBBBHB",7,5,2,9,392,2)
+    if host_volume:
+        feature = next(d for d in descriptors if d[1:4] == b"\x24\x06\x03")
+        assert feature == pack("<5B3IB",18,0x24,6,3,1,15,0,0,0)
+        output = next(d for d in descriptors if d[1:4] == b"\x24\x03\x02")
+        assert output[7] == feature[3]
+        control = next(d for d in descriptors if d[:3] == b"\x09\x24\x01")
+        assert unpack_from("<H",control,6)[0] == 9+8+17+18+12
 for rate in clock_rates:
     clock_rate(rate)
     request(0xa1,1,0x0100,0x0400,4)
@@ -527,7 +537,7 @@ if rate_192:
     assert word(USB+0x900)&0x200000 and current()==(0,0)
     print("All three full-speed formats passed; full-speed alternate 4 stalled.",flush=True)
 
-if pcm_32:
+if pcm_32 and not host_volume:
     for bits in (16,24,32):
         peak = 1 << (bits-1)
         samples = [-peak, -peak+1, -513, -61, -2, -1, 0, 1, 2, 61, 513, peak-2, peak-1]
@@ -549,6 +559,7 @@ if pcm_32:
             assert word(STATE+0x38) == int(len(scaled)-scaled.count(0)>=2)
     print("16-, 24- and 32-bit gain, signed endpoints, low bits and mute passed.",flush=True)
 
+if pcm_32:
     # Exercise the real enumeration callback and the stock physical key
     # handler. Only the two DAC register writes are modelled.
     for hs in (False,True):
@@ -571,4 +582,134 @@ if pcm_32:
             expected = [(0x90001,attenuation),(0x90002,attenuation)] if enabled and attenuation is not None else []
             assert dac_writes == expected
     print("USB-speed connection state and the native volume keys matched the expected DAC writes.",flush=True)
+
+if host_volume:
+    FEATURE = 0x0300
+    MUTE = 0x0100
+    VOLUME = 0x0200
+    GAIN_ONE = 1 << 30
+    def decibels(db):
+        return pack("<h", int(db * 256))
+
+    def write_host_control(control, data, received=None):
+        request(0x21,1,control,FEATURE,len(data))
+        assert read(EP0,1) == b"\x03" and half(EP0+12) == len(data)
+        cpu.mem_write(word(EP0+16),data)
+        cpu.mem_write(EP0+14,pack("<H",len(data) if received is None else received))
+        execute(0x0307f250,EP0,2)
+        if received is None or received >= len(data):
+            assert events[-1] == ("ack",)
+
+    for hs in (False, True):
+        set_speed(hs)
+        request(0,9,1)
+        get_cur = 1 if hs else 0x81
+        request(0xa1,get_cur,VOLUME,FEATURE,2)
+        response(decibels(0))
+        request(0xa1,get_cur,MUTE,FEATURE,1)
+        response(b"\0")
+        if hs:
+            limits = b"\x01\x00" + decibels(-96) + decibels(0) + decibels(1)
+            request(0xa1,2,VOLUME,FEATURE,2)
+            response(limits[:2])
+            request(0xa1,2,VOLUME,FEATURE,8)
+            response(limits)
+        else:
+            for command, level in ((0x82,-96),(0x83,0),(0x84,1)):
+                request(0xa1,command,VOLUME,FEATURE,2)
+                response(decibels(level))
+
+        for sent, reported in ((-20,-20),(-23.5,-24),(-100,-96),(3,0),(-128,-128)):
+            write_host_control(VOLUME,decibels(sent))
+            request(0xa1,get_cur,VOLUME,FEATURE,2)
+            response(decibels(reported))
+            gain = unpack("<i",read(STREAM+64,4))[0] + GAIN_ONE
+            assert abs(gain / GAIN_ONE - (0 if reported == -128 else 10**(reported/20))) < 1e-8
+
+        write_host_control(VOLUME,decibels(-20))
+        write_host_control(VOLUME,decibels(0),received=1)
+        write_host_control(VOLUME,decibels(0),received=3)
+        request(0xa1,get_cur,VOLUME,FEATURE,2)
+        response(decibels(-20))
+        for value, expected_mute in ((1,1),(2,1),(0,0)):
+            write_host_control(MUTE,bytes([value]))
+            request(0xa1,get_cur,MUTE,FEATURE,1)
+            response(bytes([expected_mute]))
+        for bm, command, control, entity, length in (
+            (0xa1, get_cur, VOLUME+1, FEATURE, 2),
+            (0xa1, get_cur, VOLUME, FEATURE+1, 2),
+            (0xa1, 2 if hs else 0x82, MUTE, FEATURE, 1),
+            (0x21, 1, VOLUME, FEATURE, 1),
+            (0x21, 1, VOLUME, FEATURE, 0),
+        ):
+            endpoint = USB + (0x900 if bm & 0x80 or not length else 0xb00)
+            put(endpoint,word(endpoint)&~0x200000)
+            request(bm,command,control,entity,length)
+            assert word(endpoint)&0x200000, (hs,bm,command,control,entity,length)
+        request(0x21,0x0a,0,2,0)
+        assert events[-1] == ("ack",)
+        set_speed(hs)
+        request(0xa1,get_cur,VOLUME,FEATURE,2)
+        response(decibels(0))
+    print("UAC1 and UAC2 host volume/mute, limits, silence, invalid requests and reconnect reset passed.",flush=True)
+
+    # Exercise the stock 48 kHz restart with a full audio ring. Earlier
+    # monitor checks stubbed its entry point, so restore the first halfword.
+    resume = 0x030803f0
+    offset = load-base+0x200+resume-run_address
+    cpu.mem_write(resume,image[offset:offset+2])
+    stub(0x0305094e)
+    stub(0x03066ba0)
+    cpu.ctl_flush_tb()
+    for hs, rate, bits, alternate in ((False,48000,16,1),(True,48000,16,1),
+                                      (True,96000,24,2),(True,192000,32,5)):
+        set_speed(hs)
+        request(0,9,1)
+        write_host_control(VOLUME,decibels(-20))
+        if hs:
+            clock_rate(rate)
+        request(1,11,alternate,1)
+        poll()
+        execute(0x0307ff56)
+        request(0xa1,1 if hs else 0x81,VOLUME,FEATURE,2)
+        response(decibels(-20))
+        count = word(STATE+0x40)
+        peak = 1 << (bits-1)
+        samples = ([-peak,-peak+1,-513,-61,-2,-1,0,1,2,61,513,peak-1] * count)[:count]
+        width = max(24,bits)
+        for db, mute, local_enabled in ((0,0,1),(-20,0,1),(-96,0,1),(-128,0,1),
+                                        (-20,1,1),(-20,0,0),(-20,0,1)):
+            write_host_control(VOLUME,decibels(db))
+            write_host_control(MUTE,bytes([mute]))
+            cpu.mem_write(0x0302235e,bytes([local_enabled]))
+            gain = unpack("<i",read(STREAM+64,4))[0] + GAIN_ONE
+            if mute or not local_enabled:
+                gain = 0
+            scaled = [(abs(x) * gain * (1 << (width-bits)) // GAIN_ONE) * (-1 if x < 0 else 1)
+                      for x in samples]
+            gold = converted(scaled,width)
+            ring_data(0,converted(samples,bits)*2)
+            put(STATE+0x14,count*8,0)
+            put(STATE+0x20,0,count)
+            put(STATE+0x3c,0)
+            cpu.mem_write(STATE+6,bytes(4))
+            if rate >= 96000:
+                cpu.reg_write(UC_ARM_REG_R5,STATE)
+                execute(0x03080116,stop=0x0308011a)
+                copied.clear()
+            execute(0x0307fede)
+            actual = copied[-1][1] if rate >= 96000 else events[-1][-1]
+            assert actual == gold, (hs,rate,bits,db,mute,local_enabled)
+            assert word(STATE+0x34) == scaled.count(0)
+            assert word(STATE+0x38) == int(count-scaled.count(0)>=2)
+        if rate == 48000:
+            put(STATE+0x14,count*8,0)
+            cpu.mem_write(STATE+6,pack("<HH",4,3))
+            execute(resume)
+            assert events[-1][-1] == bytes(count*4)
+            execute(0x0307fede)
+            assert events[-1][-1] == gold
+        request(1,11,0,1)
+        poll()
+    print("Host attenuation and mute reached real DMA paths at 48, 96 and 192 kHz, including 48 kHz underrun restart.",flush=True)
 
